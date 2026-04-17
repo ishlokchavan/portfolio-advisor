@@ -21,6 +21,24 @@ export default function NewProperty() {
     expected_handover: ''
   });
 
+  function normalizeExtraction(data: any) {
+
+    return {
+      project_name: data.project_name ?? null,
+      developer: data.developer ?? null,
+      unit_number: data.unit_number === "Price" ? null : data.unit_number,
+      purchase_price: Number(data.purchase_price) || 0,
+      payment_plan_type: data.payment_plan_type ?? null,
+      expected_handover: data.expected_handover ?? null,
+      milestones: (data.milestones ?? []).map((m: any) => ({
+        milestone: m.milestone.trim(),
+        due_date: m.due_date ?? null,
+        amount: Number(m.amount)
+      }))
+    }
+
+  }
+
   const handleFile = async (file: File) => {
     setExtracting(true); setErr('');
     try {
@@ -61,35 +79,100 @@ export default function NewProperty() {
   };
 
   const submit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setSaving(true); setErr('');
 
-    const price = Number(form.purchase_price);
-    const { data: prop, error } = await supabase.from('properties').insert({
-      project_name: form.project_name,
-      developer: form.developer || null,
-      unit_number: form.unit_number || null,
-      purchase_price: price,
-      payment_plan_type: form.payment_plan_type,
-      expected_handover: form.expected_handover || null
-    }).select().single();
+    e.preventDefault()
+    setSaving(true)
+    setErr("")
 
-    if (error || !prop) { setErr(error?.message ?? 'Error'); setSaving(false); return; }
+    try {
 
-    const milestones = extractedMilestones && extractedMilestones.length > 0
-      ? extractedMilestones
-      : (form.expected_handover && price > 0
-        ? generateMilestones(form.payment_plan_type, price, form.expected_handover)
-        : []);
+      const normalized = normalizeExtraction({
+        project_name: form.project_name,
+        developer: form.developer,
+        unit_number: form.unit_number,
+        purchase_price: Number(form.purchase_price),
+        payment_plan_type: form.payment_plan_type,
+        expected_handover: form.expected_handover,
+        milestones: extractedMilestones
+      })
 
-    if (milestones.length > 0) {
-      await supabase.from('payment_schedules').insert(
-        milestones.map(m => ({ ...m, property_id: prop.id, status: 'upcoming' }))
-      );
+      // get logged in user
+      const { data: { user } } = await supabase.auth.getUser()
+
+      if (!user) throw new Error("User not authenticated")
+
+      // 1️⃣ Insert property
+      const { data: property, error } = await supabase
+        .from("properties")
+        .insert({
+          project_name: normalized.project_name,
+          developer: normalized.developer,
+          unit_number: normalized.unit_number,
+          purchase_price: normalized.purchase_price,
+          payment_plan_type: normalized.payment_plan_type,
+          expected_handover: normalized.expected_handover,
+          created_by: user.id
+        })
+        .select()
+        .single()
+
+      if (error) throw error
+
+
+      // 2️⃣ Insert property owner (IMPORTANT)
+      const { error: ownerError } = await supabase
+        .from("property_owners")
+        .insert({
+          property_id: property.id,
+          owner_id: user.id,
+          ownership_percentage: 100
+        })
+
+      if (ownerError) throw ownerError
+
+
+      // 3️⃣ Insert milestones
+      if (normalized.milestones.length > 0) {
+
+        const rows = normalized.milestones.map((m: any) => {
+
+          let due = m.due_date
+
+          // final milestone fallback
+          if (!due && normalized.expected_handover)
+            due = normalized.expected_handover
+
+          return {
+            milestone: m.milestone,
+            due_date: due,
+            amount: m.amount,
+            property_id: property.id,
+            status: "upcoming"
+          }
+
+        })
+
+        const { error: scheduleError } = await supabase
+          .from("payment_schedules")
+          .insert(rows)
+
+        if (scheduleError) throw scheduleError
+
+      }
+
+      router.push(`/properties/${property.id}`)
+
+    } catch (e: any) {
+
+      setErr(e.message)
+
+    } finally {
+
+      setSaving(false)
+
     }
 
-    router.push(`/properties/${prop.id}`);
-  };
+  }
 
   const input = 'w-full border border-slate-200 rounded-xl px-4 py-3';
 
@@ -139,12 +222,25 @@ export default function NewProperty() {
             value={form.purchase_price} onChange={e => setForm({ ...form, purchase_price: e.target.value })} />
           <div>
             <label className="block text-xs text-slate-500 mb-1">Payment Plan Template</label>
-            <select className={input} value={form.payment_plan_type}
-              onChange={e => setForm({ ...form, payment_plan_type: e.target.value as PaymentPlanTemplate })}>
+            <select
+              className={input}
+              value={form.payment_plan_type}
+              onChange={e => setForm({ ...form, payment_plan_type: e.target.value as PaymentPlanTemplate })}
+            >
+
+              {/* detected plan */}
+              {form.payment_plan_type &&
+                !["80/20", "70/30", "60/40", "Post Handover"].includes(form.payment_plan_type) && (
+                  <option value={form.payment_plan_type}>
+                    {form.payment_plan_type}
+                  </option>
+                )}
+
               <option value="80/20">80/20</option>
               <option value="70/30">70/30</option>
               <option value="60/40">60/40</option>
               <option value="Post Handover">Post Handover</option>
+
             </select>
             {extractedMilestones && (
               <div className="text-xs text-slate-500 mt-1">
